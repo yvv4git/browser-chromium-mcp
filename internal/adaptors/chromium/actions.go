@@ -2,8 +2,11 @@ package chromium
 
 import (
 	"context"
+	"errors"
+	"fmt"
 
-	"github.com/chromedp/chromedp"
+	"github.com/go-rod/rod"
+	"github.com/go-rod/rod/lib/proto"
 	"github.com/yvv4git/browser-chromium-mcp/internal/domain"
 )
 
@@ -13,21 +16,47 @@ func (c *Client) Snapshot(ctx context.Context, tabID, sessionKey string) (*domai
 		return nil, err
 	}
 
-	var url string
 	var body string
-	if err := c.runTab(ctx, t, chromedp.Location(&url), chromedp.Evaluate(_snapshotJS, &body)); err != nil {
+
+	if err := c.runTab(ctx, t, func(page *rod.Page) error {
+		res, err := page.Eval(_snapshotJS)
+		if err != nil {
+			return err
+		}
+
+		body = res.Value.Str()
+
+		return nil
+	}); err != nil {
 		return nil, err
 	}
 
 	t.mu.Lock()
 	t.refsCount = countRefs(body)
+	refsCount := t.refsCount
 	t.mu.Unlock()
 
+	meta := c.readMeta(t)
+
 	return &domain.Snapshot{
-		URL:       url,
+		URL:       meta.URL,
 		Snapshot:  body,
-		RefsCount: t.refsCount,
+		RefsCount: refsCount,
 	}, nil
+}
+
+func (c *Client) element(page *rod.Page, selector string) (*rod.Element, error) {
+	el, err := page.Element(selector)
+	if err != nil {
+		var notFound *rod.ElementNotFoundError
+		if errors.As(err, &notFound) {
+			return nil, fmt.Errorf("%w: %s", domain.ErrElementNotFound, selector)
+		}
+
+		return nil, err
+	}
+
+	return el, nil
 }
 
 func (c *Client) Click(ctx context.Context, tabID, sessionKey, ref, selector string) error {
@@ -41,11 +70,14 @@ func (c *Client) Click(ctx context.Context, tabID, sessionKey, ref, selector str
 		return err
 	}
 
-	if err := c.runTab(ctx, t, chromedp.WaitVisible(sel, chromedp.ByQuery), chromedp.Click(sel, chromedp.ByQuery)); err != nil {
-		return err
-	}
+	return c.runTab(ctx, t, func(page *rod.Page) error {
+		el, err := c.element(page, sel)
+		if err != nil {
+			return err
+		}
 
-	return nil
+		return el.Click(proto.InputMouseButtonLeft, 1)
+	})
 }
 
 func (c *Client) Type(ctx context.Context, tabID, sessionKey, ref, selector, text string) error {
@@ -59,11 +91,14 @@ func (c *Client) Type(ctx context.Context, tabID, sessionKey, ref, selector, tex
 		return err
 	}
 
-	if err := c.runTab(ctx, t, chromedp.WaitVisible(sel, chromedp.ByQuery), chromedp.SendKeys(sel, text, chromedp.ByQuery)); err != nil {
-		return err
-	}
+	return c.runTab(ctx, t, func(page *rod.Page) error {
+		el, err := c.element(page, sel)
+		if err != nil {
+			return err
+		}
 
-	return nil
+		return el.Input(text)
+	})
 }
 
 func (c *Client) Press(ctx context.Context, tabID, sessionKey, key string) error {
@@ -77,11 +112,9 @@ func (c *Client) Press(ctx context.Context, tabID, sessionKey, key string) error
 		return err
 	}
 
-	if err := c.runTab(ctx, t, chromedp.KeyEvent(k)); err != nil {
-		return err
-	}
-
-	return nil
+	return c.runTab(ctx, t, func(page *rod.Page) error {
+		return page.Keyboard.Type(k)
+	})
 }
 
 func (c *Client) Scroll(ctx context.Context, tabID, sessionKey, direction string, amount int) error {
@@ -95,11 +128,11 @@ func (c *Client) Scroll(ctx context.Context, tabID, sessionKey, direction string
 		return err
 	}
 
-	if err := c.runTab(ctx, t, chromedp.Evaluate(script, nil)); err != nil {
-		return err
-	}
+	return c.runTab(ctx, t, func(page *rod.Page) error {
+		_, err := page.Eval(script)
 
-	return nil
+		return err
+	})
 }
 
 func (c *Client) Links(ctx context.Context, tabID, sessionKey string, limit, offset int) (*domain.Links, error) {
@@ -116,7 +149,15 @@ func (c *Client) Links(ctx context.Context, tabID, sessionKey string, limit, off
 	}
 
 	var all []domain.Link
-	if err := c.runTab(ctx, t, chromedp.Evaluate(_linksJS, &all)); err != nil {
+
+	if err := c.runTab(ctx, t, func(page *rod.Page) error {
+		res, err := page.Eval(_linksJS)
+		if err != nil {
+			return err
+		}
+
+		return res.Value.Unmarshal(&all)
+	}); err != nil {
 		return nil, err
 	}
 
@@ -149,19 +190,22 @@ func (c *Client) Screenshot(ctx context.Context, tabID, sessionKey string, fullP
 		return nil, err
 	}
 
-	var buf []byte
-	if fullPage {
-		if err := c.runTab(ctx, t, chromedp.FullScreenshot(&buf, 90)); err != nil {
-			return nil, err
-		}
-		return buf, nil
-	}
+	var data []byte
 
-	if err := c.runTab(ctx, t, chromedp.CaptureScreenshot(&buf)); err != nil {
+	if err := c.runTab(ctx, t, func(page *rod.Page) error {
+		shot, err := page.Screenshot(fullPage, nil)
+		if err != nil {
+			return err
+		}
+
+		data = shot
+
+		return nil
+	}); err != nil {
 		return nil, err
 	}
 
-	return buf, nil
+	return data, nil
 }
 
 func (c *Client) Evaluate(ctx context.Context, tabID, sessionKey, expression string) (*domain.Evaluate, error) {
@@ -170,30 +214,39 @@ func (c *Client) Evaluate(ctx context.Context, tabID, sessionKey, expression str
 		return nil, err
 	}
 
-	var res any
-	if err := c.runTab(ctx, t, chromedp.Evaluate(expression, &res)); err != nil {
+	var result any
+
+	if err := c.runTab(ctx, t, func(page *rod.Page) error {
+		res, err := proto.RuntimeEvaluate{
+			Expression:    expression,
+			ReturnByValue: true,
+			AwaitPromise:  true,
+			UserGesture:   true,
+		}.Call(page)
+		if err != nil {
+			return err
+		}
+
+		result = res.Result.Value.Val()
+
+		return nil
+	}); err != nil {
 		return &domain.Evaluate{OK: false, Result: nil}, err
 	}
 
-	return &domain.Evaluate{OK: true, Result: res}, nil
+	return &domain.Evaluate{OK: true, Result: result}, nil
 }
 
-func (c *Client) NetworkRequests(ctx context.Context, tabID, sessionKey string) ([]domain.Resource, error) {
-	_, t, err := c.tabFor(sessionKey, tabID)
+func (c *Client) NetworkRequests(_ context.Context, tabID, sessionKey string) ([]domain.Resource, error) {
+	_, _, err := c.tabFor(sessionKey, tabID)
 	if err != nil {
-		return nil, err
-	}
-
-	if err := c.runTab(ctx, t, chromedp.ActionFunc(func(ctx context.Context) error {
-		return nil
-	})); err != nil {
 		return nil, err
 	}
 
 	return []domain.Resource{}, nil
 }
 
-func (c *Client) Stats(ctx context.Context, tabID, sessionKey string) (*domain.Stats, error) {
+func (c *Client) Stats(_ context.Context, tabID, sessionKey string) (*domain.Stats, error) {
 	_, t, err := c.tabFor(sessionKey, tabID)
 	if err != nil {
 		return nil, err

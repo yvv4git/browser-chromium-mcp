@@ -333,7 +333,7 @@ type jsonSchema struct {
 
 func (s *Server) Serve(ctx context.Context) error {
 	transport := fmt.Sprintf("%v", s.opts.Transport)
-	if transport == "http" || transport == "http" {
+	if transport == "http" {
 		addr := s.opts.HTTPAddr
 		if addr == "" {
 			addr = ":8080"

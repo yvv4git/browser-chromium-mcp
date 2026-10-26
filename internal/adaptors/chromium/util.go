@@ -4,11 +4,12 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/go-rod/rod/lib/input"
 	"github.com/yvv4git/browser-chromium-mcp/internal/domain"
 )
 
 const (
-	_snapshotJS = `(() => {
+	_snapshotJS = `() => {
 		const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT, null);
 		let ref = 0;
 		const results = [];
@@ -35,9 +36,9 @@ const (
 			results.push({ref: r, role: getRole(el), name: getName(el)});
 		}
 		return results.map(x => '[' + x.ref + '] ' + x.role + ' "' + x.name.replace(/"/g, "'") + '"').join('\n');
-	})()`
+	}`
 
-	_linksJS = `(() => {
+	_linksJS = `() => {
 		const links = [];
 		document.querySelectorAll('a[href]').forEach(a => {
 			const href = a.href;
@@ -46,7 +47,7 @@ const (
 			links.push({url: href, text});
 		});
 		return links;
-	})()`
+	}`
 )
 
 func countRefs(s string) int {
@@ -62,29 +63,34 @@ func countRefs(s string) int {
 	return count
 }
 
-func mapKey(key string) (string, error) {
+func mapKey(key string) (input.Key, error) {
 	switch strings.ToLower(key) {
 	case "enter":
-		return "\r", nil
+		return input.Enter, nil
 	case "tab":
-		return "\t", nil
+		return input.Tab, nil
 	case "escape", "esc":
-		return "\u001b", nil
+		return input.Escape, nil
 	case "backspace":
-		return "\b", nil
+		return input.Backspace, nil
 	case "delete":
-		return "\u007f", nil
+		return input.Delete, nil
 	case "arrowup", "up":
-		return "\u001b[A", nil
+		return input.ArrowUp, nil
 	case "arrowdown", "down":
-		return "\u001b[B", nil
+		return input.ArrowDown, nil
 	case "arrowleft", "left":
-		return "\u001b[C", nil
+		return input.ArrowLeft, nil
 	case "arrowright", "right":
-		return "\u001b[D", nil
-	default:
-		return key, nil
+		return input.ArrowRight, nil
 	}
+
+	runes := []rune(key)
+	if len(runes) == 1 {
+		return input.Key(runes[0]), nil
+	}
+
+	return 0, fmt.Errorf("%w: %q", domain.ErrUnsupportedKey, key)
 }
 
 func scrollScript(direction string, amount int) (string, error) {
@@ -93,13 +99,13 @@ func scrollScript(direction string, amount int) (string, error) {
 	}
 	switch strings.ToLower(direction) {
 	case "down":
-		return fmt.Sprintf("window.scrollBy(0, %d)", amount), nil
+		return fmt.Sprintf("() => window.scrollBy(0, %d)", amount), nil
 	case "up":
-		return fmt.Sprintf("window.scrollBy(0, -%d)", amount), nil
+		return fmt.Sprintf("() => window.scrollBy(0, -%d)", amount), nil
 	case "right":
-		return fmt.Sprintf("window.scrollBy(%d, 0)", amount), nil
+		return fmt.Sprintf("() => window.scrollBy(%d, 0)", amount), nil
 	case "left":
-		return fmt.Sprintf("window.scrollBy(-%d, 0)", amount), nil
+		return fmt.Sprintf("() => window.scrollBy(-%d, 0)", amount), nil
 	default:
 		return "", domain.ErrUnsupportedDirection
 	}

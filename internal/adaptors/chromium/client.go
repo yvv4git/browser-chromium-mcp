@@ -5,11 +5,10 @@ import (
 	"fmt"
 	"regexp"
 	"sync"
+	"time"
 
-	"github.com/chromedp/cdproto/browser"
-	"github.com/chromedp/cdproto/cdp"
-	"github.com/chromedp/cdproto/input"
-	"github.com/chromedp/chromedp"
+	"github.com/go-rod/rod"
+	"github.com/go-rod/rod/lib/launcher"
 	"github.com/yvv4git/browser-chromium-mcp/internal/domain"
 	"github.com/yvv4git/browser-chromium-mcp/internal/ports"
 	"go.uber.org/zap"
@@ -20,40 +19,28 @@ const _engineChromium = "chromium"
 var _refPattern = regexp.MustCompile(`^e[0-9]+$`)
 
 type Client struct {
-	log               *zap.Logger
-	options           Options
-	allocCtx          context.Context
-	browserCtx        context.Context
-	browserCancel     context.CancelFunc
-	allocCancel       context.CancelFunc
-	selectAllModifier input.Modifier
-	mu                sync.Mutex
-	sessions          map[string]*session
+	log      *zap.Logger
+	options  Options
+	browser  *rod.Browser
+	launcher *launcher.Launcher
+	mu       sync.Mutex
+	sessions map[string]*session
 }
 
 func New(ctx context.Context, options Options, log *zap.Logger) (*Client, error) {
-	allocCtx, allocCancel := options.allocatorContext(context.Background())
-	browserCtx, browserCancel := chromedp.NewContext(allocCtx)
-
-	client := &Client{
-		log:               log,
-		options:           options,
-		allocCtx:          allocCtx,
-		browserCtx:        browserCtx,
-		browserCancel:     browserCancel,
-		allocCancel:       allocCancel,
-		selectAllModifier: options.selectAllModifier(),
-		sessions:          make(map[string]*session),
+	controlURL, l, err := options.launch(ctx)
+	if err != nil {
+		return nil, err
 	}
 
-	runCtx, runCancel := context.WithTimeout(client.browserCtx, options.StartupTimeout)
-	defer runCancel()
+	browser := rod.New().ControlURL(controlURL).NoDefaultDevice()
 
-	if err := chromedp.Run(runCtx); err != nil {
-		browserCancel()
-		allocCancel()
+	if err := connectBrowser(ctx, browser, options.startupTimeout()); err != nil {
+		if l != nil {
+			l.Kill()
+		}
 
-		return nil, fmt.Errorf("start browser: %w", err)
+		return nil, fmt.Errorf("connect browser: %w", err)
 	}
 
 	log.Info("Browser connected",
@@ -61,7 +48,32 @@ func New(ctx context.Context, options Options, log *zap.Logger) (*Client, error)
 		zap.Bool("headless", options.Headless),
 	)
 
-	return client, nil
+	return &Client{
+		log:      log,
+		options:  options,
+		browser:  browser,
+		launcher: l,
+		sessions: make(map[string]*session),
+	}, nil
+}
+
+func connectBrowser(ctx context.Context, browser *rod.Browser, timeout time.Duration) error {
+	done := make(chan error, 1)
+	go func() {
+		done <- browser.Connect()
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return fmt.Errorf("connect timed out after %s", timeout)
+	}
 }
 
 func (c *Client) Close() error {
@@ -77,14 +89,19 @@ func (c *Client) Close() error {
 		sess.close()
 	}
 
-	c.browserCancel()
-	c.allocCancel()
+	if c.browser != nil {
+		_ = c.browser.Close()
+	}
+
+	if c.launcher != nil {
+		c.launcher.Kill()
+	}
 
 	return nil
 }
 
 func (c *Client) Health(ctx context.Context) (*domain.Health, error) {
-	err := c.browserVersion(ctx)
+	_, err := c.browser.Context(ctx).Version()
 
 	return &domain.Health{
 		OK:               err == nil,
@@ -92,37 +109,6 @@ func (c *Client) Health(ctx context.Context) (*domain.Health, error) {
 		Sessions:         c.sessionCount(),
 		BrowserConnected: err == nil,
 	}, nil
-}
-
-const _pageMetaJS = `(() => { return {url: location.href, title: document.title}; })()`
-
-func (c *Client) runTab(ctx context.Context, t *tab, actions ...chromedp.Action) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	t.toolCalls++
-
-	runCtx, cancel := context.WithTimeout(ctx, c.options.ActionTimeout)
-	defer cancel()
-
-	if err := chromedp.Run(runCtx, actions...); err != nil {
-		return fmt.Errorf("run tab action: %w", err)
-	}
-
-	return nil
-}
-
-func (c *Client) browserVersion(ctx context.Context) error {
-	chromedpCtx := chromedp.FromContext(c.browserCtx)
-	if chromedpCtx == nil || chromedpCtx.Browser == nil {
-		return fmt.Errorf("browser is not initialized")
-	}
-
-	if _, _, _, _, _, err := browser.GetVersion().Do(cdp.WithExecutor(ctx, chromedpCtx.Browser)); err != nil {
-		return fmt.Errorf("get browser version: %w", err)
-	}
-
-	return nil
 }
 
 func (c *Client) sessionCount() int {

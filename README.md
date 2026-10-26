@@ -1,6 +1,6 @@
 # browser-chromium-mcp
 
-MCP-сервер для управления нативным Chromium через Chrome DevTools Protocol (CDP) с использованием [chromedp](https://github.com/chromedp/chromedp).
+MCP-сервер для управления нативным Chromium через Chrome DevTools Protocol (CDP) с использованием [go-rod](https://github.com/go-rod/rod).
 
 ## Возможности
 
@@ -92,7 +92,7 @@ cdp_url = "http://127.0.0.1:9222"
 |---|---|
 | `health` | Статус браузера, кол-во сессий, подключение |
 | `open_tab` | Открыть новую вкладку в сессии (создаст сессию при необходимости) |
-| `navigate` | Перейти по URL в указанной вкладке |
+| `navigate` | Перейти по URL; без `tabId` создаёт сессию и вкладку автоматически |
 | `back`/`forward`/`refresh` | Навигация по истории |
 | `list_tabs` | Список вкладок в сессии |
 | `close_tab` | Закрыть вкладку |

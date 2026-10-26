@@ -3,23 +3,28 @@ package chromium
 import (
 	"context"
 
-	"github.com/chromedp/chromedp"
+	"github.com/go-rod/rod"
 )
 
+const _defaultSessionKey = "default"
+
 func (c *Client) Navigate(ctx context.Context, tabID, sessionKey, url string) error {
+	if tabID == "" {
+		if sessionKey == "" {
+			sessionKey = _defaultSessionKey
+		}
+
+		_, err := c.OpenTab(ctx, sessionKey, url)
+
+		return err
+	}
+
 	_, t, err := c.tabFor(sessionKey, tabID)
 	if err != nil {
 		return err
 	}
 
-	var meta pageMeta
-	if err := c.runTab(ctx, t, chromedp.Navigate(url), chromedp.Evaluate(_pageMetaJS, &meta)); err != nil {
-		return err
-	}
-
-	c.updateMeta(t, meta)
-
-	return nil
+	return c.navigateTab(ctx, t, url)
 }
 
 func (c *Client) Back(ctx context.Context, tabID, sessionKey string) error {
@@ -28,14 +33,15 @@ func (c *Client) Back(ctx context.Context, tabID, sessionKey string) error {
 		return err
 	}
 
-	var meta pageMeta
-	if err := c.runTab(ctx, t, chromedp.NavigateBack(), chromedp.Evaluate(_pageMetaJS, &meta)); err != nil {
-		return err
-	}
+	return c.runTab(ctx, t, func(page *rod.Page) error {
+		if err := page.NavigateBack(); err != nil {
+			return err
+		}
 
-	c.updateMeta(t, meta)
+		c.waitLoad(page)
 
-	return nil
+		return nil
+	})
 }
 
 func (c *Client) Forward(ctx context.Context, tabID, sessionKey string) error {
@@ -44,14 +50,15 @@ func (c *Client) Forward(ctx context.Context, tabID, sessionKey string) error {
 		return err
 	}
 
-	var meta pageMeta
-	if err := c.runTab(ctx, t, chromedp.NavigateForward(), chromedp.Evaluate(_pageMetaJS, &meta)); err != nil {
-		return err
-	}
+	return c.runTab(ctx, t, func(page *rod.Page) error {
+		if err := page.NavigateForward(); err != nil {
+			return err
+		}
 
-	c.updateMeta(t, meta)
+		c.waitLoad(page)
 
-	return nil
+		return nil
+	})
 }
 
 func (c *Client) Refresh(ctx context.Context, tabID, sessionKey string) error {
@@ -60,12 +67,13 @@ func (c *Client) Refresh(ctx context.Context, tabID, sessionKey string) error {
 		return err
 	}
 
-	var meta pageMeta
-	if err := c.runTab(ctx, t, chromedp.Reload(), chromedp.Evaluate(_pageMetaJS, &meta)); err != nil {
-		return err
-	}
+	return c.runTab(ctx, t, func(page *rod.Page) error {
+		if err := page.Reload(); err != nil {
+			return err
+		}
 
-	c.updateMeta(t, meta)
+		c.waitLoad(page)
 
-	return nil
+		return nil
+	})
 }

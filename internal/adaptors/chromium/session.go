@@ -5,30 +5,27 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/chromedp/cdproto/cdp"
-	"github.com/chromedp/cdproto/target"
-	"github.com/chromedp/chromedp"
+	"github.com/go-rod/rod"
+	"github.com/go-rod/rod/lib/proto"
 	"github.com/yvv4git/browser-chromium-mcp/internal/domain"
 	"go.uber.org/zap"
 )
 
 type pageMeta struct {
-	URL   string `json:"url"`
-	Title string `json:"title"`
+	URL   string
+	Title string
 }
 
 type session struct {
-	key    string
-	ctx    context.Context
-	cancel context.CancelFunc
-	mu     sync.Mutex
-	tabs   map[string]*tab
+	key     string
+	browser *rod.Browser
+	mu      sync.Mutex
+	tabs    map[string]*tab
 }
 
 type tab struct {
 	id        string
-	ctx       context.Context
-	cancel    context.CancelFunc
+	page      *rod.Page
 	mu        sync.Mutex
 	url       string
 	title     string
@@ -37,27 +34,16 @@ type tab struct {
 	refsCount int
 }
 
-func (c *Client) newSession(ctx context.Context, key string) (*session, error) {
-	sessCtx, cancel := chromedp.NewContext(c.browserCtx, chromedp.WithNewBrowserContext())
-
-	startCtx, startCancel := context.WithTimeout(ctx, c.options.ActionTimeout)
-	defer startCancel()
-
-	if err := chromedp.Run(startCtx); err != nil {
-		cancel()
-
+func (c *Client) newSession(_ context.Context, key string) (*session, error) {
+	incognito, err := c.browser.Incognito()
+	if err != nil {
 		return nil, fmt.Errorf("create browser context: %w", err)
 	}
 
-	chromedpCtx := chromedp.FromContext(sessCtx)
-	sess := &session{key: key, ctx: sessCtx, cancel: cancel, tabs: make(map[string]*tab)}
-
-	if chromedpCtx.Target != nil {
-		if err := c.closeTarget(startCtx, chromedpCtx.Target.TargetID); err != nil {
-			cancel()
-
-			return nil, fmt.Errorf("close session bootstrap target: %w", err)
-		}
+	sess := &session{
+		key:     key,
+		browser: incognito,
+		tabs:    make(map[string]*tab),
 	}
 
 	c.log.Debug("Session created", zap.String("session", key))
@@ -65,38 +51,39 @@ func (c *Client) newSession(ctx context.Context, key string) (*session, error) {
 	return sess, nil
 }
 
-func (c *Client) closeTarget(ctx context.Context, id target.ID) error {
-	chromedpCtx := chromedp.FromContext(c.browserCtx)
-	if chromedpCtx == nil || chromedpCtx.Browser == nil {
-		return fmt.Errorf("browser is not initialized")
+func (c *Client) actionPage(ctx context.Context, t *tab) (*rod.Page, context.CancelFunc) {
+	runCtx, cancel := context.WithTimeout(ctx, c.options.actionTimeout())
+
+	return t.page.Context(runCtx), cancel
+}
+
+func (c *Client) pageMeta(page *rod.Page) pageMeta {
+	info, err := page.Info()
+	if err != nil {
+		return pageMeta{}
 	}
 
-	if err := target.CloseTarget(id).Do(cdp.WithExecutor(ctx, chromedpCtx.Browser)); err != nil {
-		return fmt.Errorf("close target %s: %w", id, err)
-	}
-
-	return nil
+	return pageMeta{URL: info.URL, Title: info.Title}
 }
 
 func (c *Client) openTab(ctx context.Context, sess *session, url string) (*domain.Tab, error) {
-	tabCtx, cancel := chromedp.NewContext(sess.ctx)
-	t := &tab{ctx: tabCtx, cancel: cancel}
+	page, err := sess.browser.Page(proto.TargetCreateTarget{})
+	if err != nil {
+		return nil, fmt.Errorf("open tab: %w", err)
+	}
 
-	var meta pageMeta
-	if err := c.runTab(ctx, t, chromedp.Navigate(url), chromedp.Evaluate(_pageMetaJS, &meta)); err != nil {
-		cancel()
+	t := &tab{id: string(page.TargetID), page: page}
+
+	if err := c.navigateTab(ctx, t, url); err != nil {
+		t.close()
 
 		return nil, fmt.Errorf("open tab: %w", err)
 	}
 
-	chromedpCtx := chromedp.FromContext(tabCtx)
-	t.id = string(chromedpCtx.Target.TargetID)
-	t.url = meta.URL
-	t.title = meta.Title
-	t.visited = append(t.visited, meta.URL)
+	meta := c.readMeta(t)
 
 	if err := sess.addTab(t); err != nil {
-		cancel()
+		t.close()
 
 		return nil, err
 	}
@@ -107,13 +94,53 @@ func (c *Client) openTab(ctx context.Context, sess *session, url string) (*domai
 		zap.String("url", url),
 	)
 
-	return &domain.Tab{TabID: t.id, TargetID: t.id, URL: t.url, Title: t.title}, nil
+	return &domain.Tab{TabID: t.id, TargetID: t.id, URL: meta.URL, Title: meta.Title}, nil
 }
 
-func (c *Client) updateMeta(t *tab, meta pageMeta) {
+func (c *Client) runTab(ctx context.Context, t *tab, action func(page *rod.Page) error) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	t.toolCalls++
+
+	page, cancel := c.actionPage(ctx, t)
+	defer cancel()
+
+	if err := action(page); err != nil {
+		return err
+	}
+
+	c.applyMeta(t, c.pageMeta(page))
+
+	return nil
+}
+
+func (c *Client) waitLoad(page *rod.Page) {
+	if err := page.WaitLoad(); err != nil {
+		c.log.Debug("Page load event did not fire", zap.Error(err))
+	}
+}
+
+func (c *Client) navigateTab(ctx context.Context, t *tab, url string) error {
+	return c.runTab(ctx, t, func(page *rod.Page) error {
+		if err := page.Navigate(url); err != nil {
+			return fmt.Errorf("navigate: %w", err)
+		}
+
+		c.waitLoad(page)
+
+		return nil
+	})
+}
+
+func (c *Client) readMeta(t *tab) pageMeta {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	return pageMeta{URL: t.url, Title: t.title}
+}
+
+func (c *Client) applyMeta(t *tab, meta pageMeta) {
 	if meta.URL != "" && meta.URL != t.url {
 		t.visited = append(t.visited, meta.URL)
 		t.url = meta.URL
@@ -124,18 +151,20 @@ func (c *Client) updateMeta(t *tab, meta pageMeta) {
 	}
 }
 
+func (c *Client) updateMeta(t *tab, meta pageMeta) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	c.applyMeta(t, meta)
+}
+
 func (c *Client) OpenTab(ctx context.Context, sessionKey, url string) (*domain.Tab, error) {
 	sess, err := c.ensureSession(ctx, sessionKey)
 	if err != nil {
 		return nil, fmt.Errorf("ensure session: %w", err)
 	}
 
-	tab, err := c.openTab(ctx, sess, url)
-	if err != nil {
-		return nil, err
-	}
-
-	return tab, nil
+	return c.openTab(ctx, sess, url)
 }
 
 func (c *Client) CloseTab(_ context.Context, sessionKey, tabID string) error {
@@ -244,9 +273,14 @@ func (s *session) close() {
 		t.close()
 	}
 
-	s.cancel()
+	_ = s.browser.Close()
 }
 
 func (t *tab) close() {
-	t.cancel()
+	if t.page == nil {
+		return
+	}
+
+	_ = t.page.Close()
+	t.page = nil
 }
