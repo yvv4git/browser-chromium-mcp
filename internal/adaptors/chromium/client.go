@@ -57,7 +57,8 @@ func New(ctx context.Context, options Options, log *zap.Logger) (*Client, error)
 			return nil, fmt.Errorf("start browser: %w", err)
 		}
 	} else {
-		startCtx, startCancel := context.WithTimeout(context.Background(), options.StartupTimeout)
+		testCtx, _ := chromedp.NewContext(allocCtx)
+		startCtx, startCancel := context.WithTimeout(testCtx, options.StartupTimeout)
 		if err := chromedp.Run(startCtx); err != nil {
 			startCancel()
 			browserCancel()
