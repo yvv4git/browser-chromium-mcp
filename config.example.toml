@@ -1,0 +1,15 @@
+[log]
+level = "info"
+
+[serve]
+# cdp_url = "http://127.0.0.1:9222"
+# exec_path = "/usr/bin/chromium"
+headless = true
+transport = "stdio"
+http_addr = ":8080"
+action_timeout = "30s"
+startup_timeout = "30s"
+http_read_timeout = "5s"
+http_shutdown_timeout = "5s"
+window_width = 1280
+window_height = 800
