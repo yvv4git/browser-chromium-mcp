@@ -46,27 +46,14 @@ func New(ctx context.Context, options Options, log *zap.Logger) (*Client, error)
 		sessions:          make(map[string]*session),
 	}
 
-	if options.CDPURL == "" {
-		startCtx, startCancel := context.WithTimeout(context.Background(), options.StartupTimeout)
-		defer startCancel()
+	runCtx, runCancel := context.WithTimeout(client.browserCtx, options.StartupTimeout)
+	defer runCancel()
 
-		if err := chromedp.Run(startCtx); err != nil {
-			browserCancel()
-			allocCancel()
+	if err := chromedp.Run(runCtx); err != nil {
+		browserCancel()
+		allocCancel()
 
-			return nil, fmt.Errorf("start browser: %w", err)
-		}
-	} else {
-		testCtx, _ := chromedp.NewContext(allocCtx)
-		startCtx, startCancel := context.WithTimeout(testCtx, options.StartupTimeout)
-		if err := chromedp.Run(startCtx); err != nil {
-			startCancel()
-			browserCancel()
-			allocCancel()
-
-			return nil, fmt.Errorf("start browser: %w", err)
-		}
-		startCancel()
+		return nil, fmt.Errorf("start browser: %w", err)
 	}
 
 	log.Info("Browser connected",
