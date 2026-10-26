@@ -151,13 +151,6 @@ func (c *Client) applyMeta(t *tab, meta pageMeta) {
 	}
 }
 
-func (c *Client) updateMeta(t *tab, meta pageMeta) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	c.applyMeta(t, meta)
-}
-
 func (c *Client) OpenTab(ctx context.Context, sessionKey, url string) (*domain.Tab, error) {
 	sess, err := c.ensureSession(ctx, sessionKey)
 	if err != nil {

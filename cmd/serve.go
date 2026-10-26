@@ -78,7 +78,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	defer logger.Sync()
+	defer func() { _ = logger.Sync() }()
 
 	browserClient, err := chromium.New(ctx, chromium.Options{
 		CDPURL:         cfg.Serve.CDPURL,
@@ -93,7 +93,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	defer browserClient.Close()
+	defer func() { _ = browserClient.Close() }()
 
 	fs := ports.Filesystem(fsadapter.New())
 
