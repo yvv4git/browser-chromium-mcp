@@ -27,7 +27,8 @@ type Options struct {
 
 func (o Options) allocatorContext(parent context.Context) (context.Context, context.CancelFunc) {
 	if o.CDPURL != "" {
-		return chromedp.NewRemoteAllocator(parent, o.CDPURL)
+		allocCtx, _ := chromedp.NewRemoteAllocator(parent, o.CDPURL)
+		return allocCtx, func() {}
 	}
 
 	return chromedp.NewExecAllocator(parent, o.execAllocatorOptions()...)

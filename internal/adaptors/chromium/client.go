@@ -32,7 +32,7 @@ type Client struct {
 }
 
 func New(ctx context.Context, options Options, log *zap.Logger) (*Client, error) {
-	allocCtx, allocCancel := options.allocatorContext(ctx)
+	allocCtx, allocCancel := options.allocatorContext(context.Background())
 	browserCtx, browserCancel := chromedp.NewContext(allocCtx)
 
 	client := &Client{
@@ -46,14 +46,26 @@ func New(ctx context.Context, options Options, log *zap.Logger) (*Client, error)
 		sessions:          make(map[string]*session),
 	}
 
-	startCtx, startCancel := context.WithTimeout(ctx, options.StartupTimeout)
-	defer startCancel()
+	if options.CDPURL == "" {
+		startCtx, startCancel := context.WithTimeout(context.Background(), options.StartupTimeout)
+		defer startCancel()
 
-	if err := chromedp.Run(startCtx); err != nil {
-		browserCancel()
-		allocCancel()
+		if err := chromedp.Run(startCtx); err != nil {
+			browserCancel()
+			allocCancel()
 
-		return nil, fmt.Errorf("start browser: %w", err)
+			return nil, fmt.Errorf("start browser: %w", err)
+		}
+	} else {
+		startCtx, startCancel := context.WithTimeout(context.Background(), options.StartupTimeout)
+		if err := chromedp.Run(startCtx); err != nil {
+			startCancel()
+			browserCancel()
+			allocCancel()
+
+			return nil, fmt.Errorf("start browser: %w", err)
+		}
+		startCancel()
 	}
 
 	log.Info("Browser connected",
@@ -94,6 +106,8 @@ func (c *Client) Health(ctx context.Context) (*domain.Health, error) {
 	}, nil
 }
 
+const _pageMetaJS = `(() => { return {url: location.href, title: document.title}; })()`
+
 func (c *Client) runTab(ctx context.Context, t *tab, actions ...chromedp.Action) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -116,7 +130,7 @@ func (c *Client) browserVersion(ctx context.Context) error {
 		return fmt.Errorf("browser is not initialized")
 	}
 
-	if _, err := browser.GetVersion().Do(cdp.WithExecutor(ctx, chromedpCtx.Browser)); err != nil {
+	if _, _, _, _, _, err := browser.GetVersion().Do(cdp.WithExecutor(ctx, chromedpCtx.Browser)); err != nil {
 		return fmt.Errorf("get browser version: %w", err)
 	}
 
