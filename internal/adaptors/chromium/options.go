@@ -93,6 +93,8 @@ func resolveControlURL(ctx context.Context, addr string) (string, error) {
 		return "", fmt.Errorf("build request %s: %w", endpoint, err)
 	}
 
+	req.Close = true
+
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("fetch %s: %w", endpoint, err)

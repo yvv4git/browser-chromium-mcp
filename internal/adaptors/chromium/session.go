@@ -17,15 +17,16 @@ type pageMeta struct {
 }
 
 type session struct {
-	key     string
-	browser *rod.Browser
-	mu      sync.Mutex
-	tabs    map[string]*tab
+	key       string
+	gen       uint64
+	contextID proto.BrowserBrowserContextID
+	mu        sync.Mutex
+	tabs      map[string]*tab
+	lastTabID string
 }
 
 type tab struct {
 	id        string
-	page      *rod.Page
 	mu        sync.Mutex
 	url       string
 	title     string
@@ -34,27 +35,23 @@ type tab struct {
 	refsCount int
 }
 
-func (c *Client) newSession(_ context.Context, key string) (*session, error) {
-	incognito, err := c.browser.Incognito()
+func (c *Client) newSession(ctx context.Context, cn *conn, key string) (*session, error) {
+	runCtx, cancel := context.WithTimeout(ctx, c.options.actionTimeout())
+	defer cancel()
+
+	res, err := proto.TargetCreateBrowserContext{}.Call(cn.browser.Context(runCtx))
 	if err != nil {
 		return nil, fmt.Errorf("create browser context: %w", err)
 	}
 
-	sess := &session{
-		key:     key,
-		browser: incognito,
-		tabs:    make(map[string]*tab),
-	}
-
 	c.log.Debug("Session created", zap.String("session", key))
 
-	return sess, nil
-}
-
-func (c *Client) actionPage(ctx context.Context, t *tab) (*rod.Page, context.CancelFunc) {
-	runCtx, cancel := context.WithTimeout(ctx, c.options.actionTimeout())
-
-	return t.page.Context(runCtx), cancel
+	return &session{
+		key:       key,
+		gen:       cn.gen,
+		contextID: res.BrowserContextID,
+		tabs:      make(map[string]*tab),
+	}, nil
 }
 
 func (c *Client) pageMeta(page *rod.Page) pageMeta {
@@ -66,24 +63,37 @@ func (c *Client) pageMeta(page *rod.Page) pageMeta {
 	return pageMeta{URL: info.URL, Title: info.Title}
 }
 
-func (c *Client) openTab(ctx context.Context, sess *session, url string) (*domain.Tab, error) {
-	page, err := sess.browser.Page(proto.TargetCreateTarget{})
+func (c *Client) openTab(ctx context.Context, cn *conn, sess *session, url string) (*domain.Tab, error) {
+	runCtx, cancel := context.WithTimeout(ctx, c.options.actionTimeout())
+	defer cancel()
+
+	sessBrowser := *cn.browser
+	sessBrowser.BrowserContextID = sess.contextID
+
+	page, err := sessBrowser.Context(runCtx).Page(proto.TargetCreateTarget{})
 	if err != nil {
 		return nil, fmt.Errorf("open tab: %w", err)
 	}
 
-	t := &tab{id: string(page.TargetID), page: page}
+	t := &tab{id: string(page.TargetID)}
 
-	if err := c.navigateTab(ctx, t, url); err != nil {
-		t.close()
+	if err := c.navigatePage(page, url); err != nil {
+		_, _ = proto.TargetCloseTarget{TargetID: page.TargetID}.Call(cn.browser)
 
 		return nil, fmt.Errorf("open tab: %w", err)
 	}
 
-	meta := c.readMeta(t)
+	meta := c.pageMeta(page)
+	t.url = meta.URL
+	t.title = meta.Title
+	t.toolCalls = 1
+
+	if t.url != "" {
+		t.visited = append(t.visited, t.url)
+	}
 
 	if err := sess.addTab(t); err != nil {
-		t.close()
+		_, _ = proto.TargetCloseTarget{TargetID: page.TargetID}.Call(cn.browser)
 
 		return nil, err
 	}
@@ -94,19 +104,35 @@ func (c *Client) openTab(ctx context.Context, sess *session, url string) (*domai
 		zap.String("url", url),
 	)
 
-	return &domain.Tab{TabID: t.id, TargetID: t.id, URL: meta.URL, Title: meta.Title}, nil
+	return &domain.Tab{TabID: t.id, TargetID: t.id, URL: t.url, Title: t.title}, nil
 }
 
-func (c *Client) runTab(ctx context.Context, t *tab, action func(page *rod.Page) error) error {
+func (c *Client) runTab(ctx context.Context, sessionKey, tabID string, action func(*tab, *rod.Page) error) error {
+	cn, err := c.open(ctx)
+	if err != nil {
+		return err
+	}
+	defer cn.close()
+
+	_, t, err := c.tabFor(cn, sessionKey, tabID)
+	if err != nil {
+		return err
+	}
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	t.toolCalls++
 
-	page, cancel := c.actionPage(ctx, t)
+	runCtx, cancel := context.WithTimeout(ctx, c.options.actionTimeout())
 	defer cancel()
 
-	if err := action(page); err != nil {
+	page, err := cn.browser.Context(runCtx).PageFromTarget(proto.TargetTargetID(t.id))
+	if err != nil {
+		return fmt.Errorf("attach tab: %w", err)
+	}
+
+	if err := action(t, page); err != nil {
 		return err
 	}
 
@@ -121,23 +147,14 @@ func (c *Client) waitLoad(page *rod.Page) {
 	}
 }
 
-func (c *Client) navigateTab(ctx context.Context, t *tab, url string) error {
-	return c.runTab(ctx, t, func(page *rod.Page) error {
-		if err := page.Navigate(url); err != nil {
-			return fmt.Errorf("navigate: %w", err)
-		}
+func (c *Client) navigatePage(page *rod.Page, url string) error {
+	if err := page.Navigate(url); err != nil {
+		return fmt.Errorf("navigate: %w", err)
+	}
 
-		c.waitLoad(page)
+	c.waitLoad(page)
 
-		return nil
-	})
-}
-
-func (c *Client) readMeta(t *tab) pageMeta {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	return pageMeta{URL: t.url, Title: t.title}
+	return nil
 }
 
 func (c *Client) applyMeta(t *tab, meta pageMeta) {
@@ -152,49 +169,87 @@ func (c *Client) applyMeta(t *tab, meta pageMeta) {
 }
 
 func (c *Client) OpenTab(ctx context.Context, sessionKey, url string) (*domain.Tab, error) {
-	sess, err := c.ensureSession(ctx, sessionKey)
+	cn, err := c.open(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer cn.close()
+
+	sess, err := c.ensureSession(ctx, cn, sessionKey)
 	if err != nil {
 		return nil, fmt.Errorf("ensure session: %w", err)
 	}
 
-	return c.openTab(ctx, sess, url)
+	return c.openTab(ctx, cn, sess, url)
 }
 
-func (c *Client) CloseTab(_ context.Context, sessionKey, tabID string) error {
-	sess, err := c.getSession(sessionKey)
+func (c *Client) CloseTab(ctx context.Context, sessionKey, tabID string) error {
+	cn, err := c.open(ctx)
+	if err != nil {
+		return err
+	}
+	defer cn.close()
+
+	sess, t, err := c.tabFor(cn, sessionKey, tabID)
 	if err != nil {
 		return err
 	}
 
-	t, err := sess.removeTab(tabID)
-	if err != nil {
-		return err
-	}
+	_, _ = sess.removeTab(tabID)
 
-	t.close()
+	runCtx, cancel := context.WithTimeout(ctx, c.options.actionTimeout())
+	defer cancel()
+
+	if _, err := (proto.TargetCloseTarget{TargetID: proto.TargetTargetID(t.id)}).Call(cn.browser.Context(runCtx)); err != nil {
+		return fmt.Errorf("close tab: %w", err)
+	}
 
 	c.log.Debug("Tab closed", zap.String("session", sessionKey), zap.String("tab", tabID))
 
 	return nil
 }
 
-func (c *Client) CloseSession(_ context.Context, sessionKey string) error {
+func (c *Client) CloseSession(ctx context.Context, sessionKey string) error {
+	cn, err := c.open(ctx)
+	if err != nil {
+		return err
+	}
+	defer cn.close()
+
 	sess := c.removeSession(sessionKey)
-	if sess == nil {
+	if sess == nil || sess.gen != cn.gen {
 		return domain.ErrSessionNotFound
 	}
 
-	sess.close()
+	runCtx, cancel := context.WithTimeout(ctx, c.options.actionTimeout())
+	defer cancel()
+
+	sessBrowser := *cn.browser
+	sessBrowser.BrowserContextID = sess.contextID
+
+	if err := sessBrowser.Context(runCtx).Close(); err != nil {
+		return fmt.Errorf("close session: %w", err)
+	}
 
 	c.log.Debug("Session closed", zap.String("session", sessionKey))
 
 	return nil
 }
 
-func (c *Client) ListTabs(_ context.Context, sessionKey string) (*domain.ListTabs, error) {
+func (c *Client) ListTabs(ctx context.Context, sessionKey string) (*domain.ListTabs, error) {
+	cn, err := c.open(ctx)
+	if err != nil {
+		return nil, err
+	}
+	cn.close()
+
 	sess, err := c.getSession(sessionKey)
 	if err != nil {
 		return nil, err
+	}
+
+	if sess.gen != cn.gen {
+		return nil, domain.ErrSessionNotFound
 	}
 
 	return &domain.ListTabs{Tabs: sess.listTabs()}, nil
@@ -209,6 +264,7 @@ func (s *session) addTab(t *tab) error {
 	}
 
 	s.tabs[t.id] = t
+	s.lastTabID = t.id
 
 	return nil
 }
@@ -224,6 +280,16 @@ func (s *session) removeTab(tabID string) (*tab, error) {
 
 	delete(s.tabs, tabID)
 
+	if s.lastTabID == tabID {
+		s.lastTabID = ""
+
+		for id := range s.tabs {
+			s.lastTabID = id
+
+			break
+		}
+	}
+
 	return t, nil
 }
 
@@ -231,10 +297,16 @@ func (s *session) tab(tabID string) (*tab, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if tabID == "" {
+		tabID = s.lastTabID
+	}
+
 	t, ok := s.tabs[tabID]
 	if !ok {
 		return nil, domain.ErrTabNotFound
 	}
+
+	s.lastTabID = tabID
 
 	return t, nil
 }
@@ -251,29 +323,4 @@ func (s *session) listTabs() []domain.TabInfo {
 	}
 
 	return tabs
-}
-
-func (s *session) close() {
-	s.mu.Lock()
-	tabs := make([]*tab, 0, len(s.tabs))
-	for _, t := range s.tabs {
-		tabs = append(tabs, t)
-	}
-	s.tabs = nil
-	s.mu.Unlock()
-
-	for _, t := range tabs {
-		t.close()
-	}
-
-	_ = s.browser.Close()
-}
-
-func (t *tab) close() {
-	if t.page == nil {
-		return
-	}
-
-	_ = t.page.Close()
-	t.page = nil
 }
