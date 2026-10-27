@@ -19,21 +19,13 @@ func (c *Client) Navigate(ctx context.Context, tabID, sessionKey, url string) er
 		return err
 	}
 
-	_, t, err := c.tabFor(sessionKey, tabID)
-	if err != nil {
-		return err
-	}
-
-	return c.navigateTab(ctx, t, url)
+	return c.runTab(ctx, sessionKey, tabID, func(_ *tab, page *rod.Page) error {
+		return c.navigatePage(page, url)
+	})
 }
 
 func (c *Client) Back(ctx context.Context, tabID, sessionKey string) error {
-	_, t, err := c.tabFor(sessionKey, tabID)
-	if err != nil {
-		return err
-	}
-
-	return c.runTab(ctx, t, func(page *rod.Page) error {
+	return c.runTab(ctx, sessionKey, tabID, func(_ *tab, page *rod.Page) error {
 		if err := page.NavigateBack(); err != nil {
 			return err
 		}
@@ -45,12 +37,7 @@ func (c *Client) Back(ctx context.Context, tabID, sessionKey string) error {
 }
 
 func (c *Client) Forward(ctx context.Context, tabID, sessionKey string) error {
-	_, t, err := c.tabFor(sessionKey, tabID)
-	if err != nil {
-		return err
-	}
-
-	return c.runTab(ctx, t, func(page *rod.Page) error {
+	return c.runTab(ctx, sessionKey, tabID, func(_ *tab, page *rod.Page) error {
 		if err := page.NavigateForward(); err != nil {
 			return err
 		}
@@ -62,12 +49,7 @@ func (c *Client) Forward(ctx context.Context, tabID, sessionKey string) error {
 }
 
 func (c *Client) Refresh(ctx context.Context, tabID, sessionKey string) error {
-	_, t, err := c.tabFor(sessionKey, tabID)
-	if err != nil {
-		return err
-	}
-
-	return c.runTab(ctx, t, func(page *rod.Page) error {
+	return c.runTab(ctx, sessionKey, tabID, func(_ *tab, page *rod.Page) error {
 		if err := page.Reload(); err != nil {
 			return err
 		}
